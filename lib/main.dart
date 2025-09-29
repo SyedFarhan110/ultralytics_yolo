@@ -8,7 +8,6 @@ import 'dart:typed_data';
 import 'dart:async';
 import 'package:video_thumbnail/video_thumbnail.dart';
 
-
 void main() => runApp(YOLOApp());
 
 class YOLOApp extends StatelessWidget {
@@ -32,7 +31,7 @@ class YOLODemo extends StatefulWidget {
   _YOLODemoState createState() => _YOLODemoState();
 }
 
-class _YOLODemoState extends State<YOLODemo> {
+class _YOLODemoState extends State<YOLODemo> with SingleTickerProviderStateMixin {
   YOLO? yolo;
   File? selectedImage;
   File? selectedVideo;
@@ -48,6 +47,13 @@ class _YOLODemoState extends State<YOLODemo> {
   // Add variables to store image/video dimensions
   int imageWidth = 0;
   int imageHeight = 0;
+
+  // Smoothing variables
+  List<dynamic> previousResults = [];
+  List<dynamic> smoothedResults = [];
+  double smoothingFactor = 0.7; // Higher = smoother but more lag (0.0 - 1.0)
+  AnimationController? animationController;
+  int frameCount = 0;
 
   final List<String> cocoLabels = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
@@ -66,6 +72,18 @@ class _YOLODemoState extends State<YOLODemo> {
   void initState() {
     super.initState();
     loadYOLO();
+
+    // Initialize animation controller for smooth transitions
+    animationController = AnimationController(
+      vsync: this,
+      duration: Duration(milliseconds: 100),
+    )..addListener(() {
+      if (mounted && currentMediaType == MediaType.video) {
+        setState(() {});
+      }
+    });
+
+    animationController!.repeat();
   }
 
   Future<void> loadYOLO() async {
@@ -272,10 +290,11 @@ class _YOLODemoState extends State<YOLODemo> {
     setState(() {
       isVideoProcessing = true;
       statusMessage = "Processing video frames...";
+      frameCount = 0;
     });
 
-    // Process frames every 200ms (5 FPS detection rate)
-    detectionTimer = Timer.periodic(Duration(milliseconds: 200), (timer) {
+    // Process frames every 100ms (10 FPS detection rate) - increased from 200ms
+    detectionTimer = Timer.periodic(Duration(milliseconds: 100), (timer) {
       if (!videoController!.value.isPlaying) {
         timer.cancel();
         return;
@@ -303,6 +322,8 @@ class _YOLODemoState extends State<YOLODemo> {
     });
 
     try {
+      frameCount++;
+
       // Capture current frame as bytes
       final Uint8List? frameBytes = await captureVideoFrame();
 
@@ -337,11 +358,15 @@ class _YOLODemoState extends State<YOLODemo> {
           }
         }
 
+        // Apply smoothing to results
+        smoothedResults = smoothDetections(processedResults);
+
         setState(() {
-          results = processedResults;
+          results = smoothedResults;
+          previousResults = processedResults;
           statusMessage = results.isEmpty
               ? "No objects detected in current frame"
-              : "Found ${results.length} objects in current frame";
+              : "Found ${results.length} objects (Frame: $frameCount)";
         });
       }
     } catch (e) {
@@ -353,21 +378,108 @@ class _YOLODemoState extends State<YOLODemo> {
     }
   }
 
+  // Smooth detection results using exponential moving average
+  List<dynamic> smoothDetections(List<dynamic> newDetections) {
+    if (previousResults.isEmpty) {
+      return newDetections;
+    }
+
+    List<dynamic> smoothed = [];
+
+    for (var newDetection in newDetections) {
+      // Try to find matching detection from previous frame
+      var matchedPrevious = findMatchingDetection(newDetection, previousResults);
+
+      if (matchedPrevious != null) {
+        // Smooth the bounding box coordinates
+        smoothed.add({
+          'class': newDetection['class'],
+          'confidence': newDetection['confidence'],
+          'box': newDetection['box'],
+          'x1': lerp(matchedPrevious['x1'], newDetection['x1'], 1.0 - smoothingFactor),
+          'y1': lerp(matchedPrevious['y1'], newDetection['y1'], 1.0 - smoothingFactor),
+          'x2': lerp(matchedPrevious['x2'], newDetection['x2'], 1.0 - smoothingFactor),
+          'y2': lerp(matchedPrevious['y2'], newDetection['y2'], 1.0 - smoothingFactor),
+        });
+      } else {
+        // New detection, no smoothing
+        smoothed.add(newDetection);
+      }
+    }
+
+    return smoothed;
+  }
+
+  // Find matching detection based on IOU (Intersection over Union) and class
+  Map<String, dynamic>? findMatchingDetection(
+      Map<String, dynamic> detection, List<dynamic> previousList) {
+    double maxIOU = 0.3; // Minimum IOU threshold to consider a match
+    Map<String, dynamic>? bestMatch;
+
+    for (var prev in previousList) {
+      // Only match same class
+      if (prev['class'] != detection['class']) continue;
+
+      double iou = calculateIOU(detection, prev);
+      if (iou > maxIOU) {
+        maxIOU = iou;
+        bestMatch = prev as Map<String, dynamic>;
+      }
+    }
+
+    return bestMatch;
+  }
+
+  // Calculate Intersection over Union between two bounding boxes
+  double calculateIOU(Map<String, dynamic> box1, Map<String, dynamic> box2) {
+    double x1_1 = (box1['x1'] ?? 0.0).toDouble();
+    double y1_1 = (box1['y1'] ?? 0.0).toDouble();
+    double x2_1 = (box1['x2'] ?? 0.0).toDouble();
+    double y2_1 = (box1['y2'] ?? 0.0).toDouble();
+
+    double x1_2 = (box2['x1'] ?? 0.0).toDouble();
+    double y1_2 = (box2['y1'] ?? 0.0).toDouble();
+    double x2_2 = (box2['x2'] ?? 0.0).toDouble();
+    double y2_2 = (box2['y2'] ?? 0.0).toDouble();
+
+    // Calculate intersection area
+    double intersectX1 = x1_1 > x1_2 ? x1_1 : x1_2;
+    double intersectY1 = y1_1 > y1_2 ? y1_1 : y1_2;
+    double intersectX2 = x2_1 < x2_2 ? x2_1 : x2_2;
+    double intersectY2 = y2_1 < y2_2 ? y2_1 : y2_2;
+
+    if (intersectX2 < intersectX1 || intersectY2 < intersectY1) {
+      return 0.0; // No intersection
+    }
+
+    double intersectArea = (intersectX2 - intersectX1) * (intersectY2 - intersectY1);
+
+    // Calculate union area
+    double box1Area = (x2_1 - x1_1) * (y2_1 - y1_1);
+    double box2Area = (x2_2 - x1_2) * (y2_2 - y1_2);
+    double unionArea = box1Area + box2Area - intersectArea;
+
+    return unionArea > 0 ? intersectArea / unionArea : 0.0;
+  }
+
+  // Linear interpolation helper
+  double lerp(dynamic a, dynamic b, double t) {
+    return (a.toDouble() * (1.0 - t)) + (b.toDouble() * t);
+  }
+
   Future<Uint8List?> captureVideoFrame() async {
     try {
       if (videoController == null || !videoController!.value.isInitialized) {
         return null;
       }
 
-      // Get current playback position
-      final position = videoController!.value.position;
-
-      // Generate thumbnail at current position
+      // Use lower quality for faster processing
       final uint8list = await VideoThumbnail.thumbnailData(
         video: selectedVideo!.path,
-        imageFormat: ImageFormat.PNG,
-        timeMs: position.inMilliseconds,
-        quality: 100,
+        // imageFormat: ImageFormat.JPEG, // JPEG is faster than PNG
+        timeMs: videoController!.value.position.inMilliseconds,
+        quality: 100, // Reduce quality from 100 to 70 for speed
+        // maxWidth: 640, // Limit resolution for faster processing
       );
 
       return uint8list;
@@ -494,7 +606,6 @@ class _YOLODemoState extends State<YOLODemo> {
                       imageHeight,
                       constraints.maxWidth,
                       constraints.maxHeight,
-                      // isVideo: false, // Explicitly mark as image
                     ),
                   ),
               ],
@@ -538,14 +649,15 @@ class _YOLODemoState extends State<YOLODemo> {
                   width: constraints.maxWidth,
                   height: constraints.maxHeight,
                   child: FittedBox(
-                    fit: BoxFit.contain,
-                    child: SizedBox(
-                      width: videoController!.value.size.width,
-                      height: videoController!.value.size.height,
-                      child: VideoPlayer(videoController!),
-                    ),
+                      fit: BoxFit.contain,
+                      child: SizedBox(
+                          width: videoController !. value.size.width,
+                          height: videoController !. value.size.height,
+                          child: VideoPlayer(videoController!),
+                      )
                   ),
                 ),
+
                 if (results.isNotEmpty && imageWidth > 0 && imageHeight > 0)
                   CustomPaint(
                     size: Size(constraints.maxWidth, constraints.maxHeight),
@@ -555,7 +667,6 @@ class _YOLODemoState extends State<YOLODemo> {
                       imageHeight,
                       constraints.maxWidth,
                       constraints.maxHeight,
-                      // isVideo: false, // Now we can use the same logic as images!
                     ),
                   ),
                 // Video controls overlay
@@ -828,8 +939,6 @@ class BoundingBoxPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (originalImageWidth == 0 || originalImageHeight == 0) return;
-
     double imageAspectRatio = originalImageWidth / originalImageHeight;
     double containerAspectRatio = displayWidth / displayHeight;
 
